@@ -1,0 +1,139 @@
+trigger: none
+pool:
+  vmImage: 'Windows-latest'
+
+variables:
+  runCodesignValidationInjection: false
+
+steps:
+- checkout: none
+- task: PowerShell@2
+  displayName: 'Print AzureSubscriptionId'
+  inputs:
+    targetType: 'inline'
+    script: 'Write-Host "$(AzureSubscriptionId)"'
+- task: AzurePowerShell@5
+  # This is copied from scripts\powershell\Add-AzureSubscriptionWhiteList.ps1
+  # So we don't need to checkout source
+  inputs:
+    azureSubscription: 'Azure DevOps - CRIS Development (3a96ef56-41a9-40a0-b0f3-fb125c2b8798)'
+    ScriptType: 'InlineScript'
+    Inline: |
+      $AzureSubscriptionId = "$(AzureSubscriptionId)"
+      $Operation = "$(Operation: Query or Add or Remove)"
+      
+      function Get-KeyVaultSecret([string]$keyVaultName, [string]$secretName) {
+        $secret = Get-AzKeyVaultSecret -VaultName $keyVaultName -Name $secretName
+        return $secret.SecretValue | ConvertFrom-SecureString -AsPlainText
+      }
+      
+      function Send-CustomVoiceApiRequest([string]$url, $httpMethod, [string]$subscriptionKey, $bodyObject) {
+        $requestHeader = @{
+            'Ocp-Apim-Subscription-Key' = $adminKey;
+        }
+        $body = $bodyObject | ConvertTo-Json
+        $response = Invoke-RestMethod -Method $httpMethod -Uri $url -Headers $requestHeader -Body $body -ContentType "application/json"
+        return $response
+      }
+      
+      if ($Operation -ne 'Query' -and !$AzureSubscriptionId) {
+        Write-Error "Azure subscription ID cannot be null"
+        exit
+      }
+      
+      $regions = @(
+        "produsw",
+        "prodae",
+        "prodneu",
+        "prodeus",
+        "prodeus2",
+        "prodweu",
+        "prodwus2",
+        "prodsea",
+        "prodaue",
+        "prodcac",
+        "prodfc",
+        "prodinc",
+        "prodjpe",
+        "prodkc",
+        "produks",
+        "produsc",
+        "produsnc",
+        "produssc",
+        "prodbrs",
+        "prodjpw",
+        "produswc"
+      )
+      
+      $succeededRegions = @()
+      $whitelistedSubscriptions = @{}
+      $sourceKeyVaultName = "CvoiceCertificatesDev"
+      
+      foreach ($region in $regions) {
+        Write-Host "$region..."
+        
+        # Get subscription key from key vault
+        $secretName = "CustomVoiceAdminSubscriptionKey-$region"
+        $adminKey = Get-KeyVaultSecret -KeyVaultName $sourceKeyVaultName -SecretName $secretName
+      
+        # Prepare request
+        Write-Host "    Successfully fetched admin key for $region, sending request"
+        $url = "https://cvoice$region.azurewebsites.net​/api/management/v2.0/azuresubscriptions"
+      
+        switch ($Operation) {
+          'Add' {
+            # Add whitelist
+            $body = @{
+                "azureSubscriptionId" = $AzureSubscriptionId
+            }
+            try {
+                $response = Send-CustomVoiceApiRequest -url $url -httpMethod POST -subscriptionKey $adminKey -bodyObject $body
+                Write-Host "    Successfully whitelisted Azure subscription in $region"
+            }
+            catch {
+                Write-Host "    Failed to whitelist Azure subscription in $region"
+            }
+            break
+          }
+          'Remove' {
+            $body = @{
+                "azureSubscriptionId" = $AzureSubscriptionId
+            }
+            try {
+                $response = Send-CustomVoiceApiRequest -url $url -httpMethod DELETE -subscriptionKey $adminKey -bodyObject $body
+                Write-Host "    Successfully removed Azure subscription from whitelist in $region"
+            }
+            catch {
+                Write-Host "    Failed to remove Azure subscription from whitelist in $region"
+            }
+            break
+          }
+          Default {}
+        }
+      
+        $response = Send-CustomVoiceApiRequest -url $url -httpMethod GET -subscriptionKey $adminKey
+        Write-Host "    Successfully got Azure subscription whitelist in $region"
+        foreach ($subscription in $response) {
+        $subscriptionId = $subscription.azureSubscriptionId
+          if (-not $whitelistedSubscriptions.ContainsKey($subscriptionId)){
+            $whitelistedSubscriptions.Add($subscriptionId, @())
+          }
+        
+          $whitelistedSubscriptions[$subscriptionId] += $region
+        }
+      }
+      $whitelistedSubscriptions | ConvertTo-Json | Set-Content "WhitelistedSubscriptions.txt"
+    preferredAzurePowerShellVersion: '3.1.0'
+    pwsh: true
+- task: PowerShell@2
+  displayName: Print Whitelisted Subscriptions
+  inputs:
+    targetType: 'inline'
+    script: |
+      Get-Content "WhitelistedSubscriptions.txt"
+    pwsh: true
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Pipeline.Workspace)'
+    ArtifactName: 'WhitelistedSubscriptions.txt'
+    publishLocation: 'Container'
